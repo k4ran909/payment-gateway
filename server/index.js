@@ -154,8 +154,8 @@ app.post("/api/paytm/check-now", async (req, res) => {
 // App: "SMS to URL Forwarder" (Android) -> POST to this URL
 app.post("/api/paytm/sms-webhook", (req, res) => {
     try {
-        const { body, from, content } = req.body; // Adapt based on app's payload
-        const msg = body || content || "";
+        const { body, from, content, message, text } = req.body; // Adapt based on app's payload
+        const msg = body || content || message || text || "";
 
         console.log(`📩 Received SMS from ${from}: ${msg}`);
 
