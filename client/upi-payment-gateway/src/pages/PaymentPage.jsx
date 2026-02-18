@@ -23,8 +23,10 @@ function PaymentPage() {
     const [order, setOrder] = useState(null);
     const [upiLink, setUpiLink] = useState('');
     const [paymentStatus, setPaymentStatus] = useState('idle');
-    // idle → pending (QR shown) → paid (customer clicked "I've Paid") → confirmed / rejected
+    // idle → pending (QR shown) → utr_entry (clicked "I've Paid") → confirmed
     const [copied, setCopied] = useState(false);
+    const [utrInput, setUtrInput] = useState('');
+    const [submittingUtr, setSubmittingUtr] = useState(false);
     const pollingRef = useRef(null);
 
     const isConfigured = upiId && payeeName;
@@ -54,6 +56,7 @@ function PaymentPage() {
         setOrder(null);
         setPaymentStatus('idle');
         setUpiLink('');
+        setUtrInput('');
         if (pollingRef.current) { clearInterval(pollingRef.current); pollingRef.current = null; }
     };
 
@@ -67,7 +70,7 @@ function PaymentPage() {
         return 'upi://pay?' + p.toString();
     };
 
-    // Poll server for admin confirmation
+    // Poll server for status changes
     const startPolling = useCallback((orderId) => {
         if (pollingRef.current) clearInterval(pollingRef.current);
         pollingRef.current = setInterval(async () => {
@@ -78,7 +81,7 @@ function PaymentPage() {
                     clearInterval(pollingRef.current);
                     pollingRef.current = null;
                     setPaymentStatus('confirmed');
-                    showToast('✅ Payment confirmed by admin!');
+                    showToast('✅ Payment confirmed!');
                 } else if (data.status === 'rejected') {
                     clearInterval(pollingRef.current);
                     pollingRef.current = null;
@@ -118,18 +121,38 @@ function PaymentPage() {
         setLoading(false);
     };
 
-    // Customer clicks "I've Paid"
-    const handleMarkPaid = async () => {
+    // Customer clicks "I've Paid" → show UTR input
+    const handlePaidClick = () => {
+        setPaymentStatus('utr_entry');
+    };
+
+    // Customer submits UTR → auto-confirm
+    const handleSubmitUtr = async () => {
         if (!order || !order.orderId || order.orderId === 'OFFLINE') {
-            setPaymentStatus('paid');
-            showToast('✅ Noted! Admin will verify.');
+            setPaymentStatus('confirmed');
+            showToast('✅ Payment confirmed!');
             return;
         }
+
+        setSubmittingUtr(true);
         try {
-            await fetch(`/api/mark-paid/${order.orderId}`, { method: 'POST' });
-        } catch { }
-        setPaymentStatus('paid');
-        showToast('📩 Payment notification sent to admin!');
+            const res = await fetch(`/api/mark-paid/${order.orderId}`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ utr: utrInput.trim() }),
+            });
+            const data = await res.json();
+            if (data.success) {
+                setPaymentStatus('confirmed');
+                showToast('🎉 Payment confirmed! Thank you!');
+                if (pollingRef.current) { clearInterval(pollingRef.current); pollingRef.current = null; }
+            } else {
+                showToast('❌ ' + (data.error || 'Failed to confirm'));
+            }
+        } catch {
+            showToast('❌ Server error. Try again.');
+        }
+        setSubmittingUtr(false);
     };
 
     // Copy UPI link
@@ -195,8 +218,8 @@ function PaymentPage() {
     // Status display
     const StatusBox = () => {
         const configs = {
-            pending: { icon: '📲', label: 'Scan QR and pay', sub: 'Then click the button below', color: 'var(--accent-2)', bg: 'rgba(6,182,212,0.06)', border: 'rgba(6,182,212,0.15)' },
-            paid: { icon: '⏳', label: 'Waiting for admin confirmation...', sub: 'Admin will verify your payment from their UPI app', color: 'var(--warning)', bg: 'rgba(245,158,11,0.06)', border: 'rgba(245,158,11,0.15)' },
+            pending: { icon: '📲', label: 'Scan QR and pay', sub: 'After paying, click the button below to confirm', color: 'var(--accent-2)', bg: 'rgba(6,182,212,0.06)', border: 'rgba(6,182,212,0.15)' },
+            utr_entry: { icon: '🔢', label: 'Enter Transaction Reference (UTR)', sub: 'Find the 12-digit UTR number in your UPI app after payment', color: 'var(--accent-1)', bg: 'rgba(79,70,229,0.06)', border: 'rgba(79,70,229,0.15)' },
             confirmed: { icon: '🎉', label: 'Payment Confirmed!', sub: 'Thank you for your payment!', color: 'var(--success)', bg: 'rgba(16,185,129,0.06)', border: 'rgba(16,185,129,0.15)' },
             rejected: { icon: '❌', label: 'Payment Rejected', sub: 'Please contact admin or try again', color: 'var(--error)', bg: 'rgba(239,68,68,0.06)', border: 'rgba(239,68,68,0.15)' },
         };
@@ -209,7 +232,7 @@ function PaymentPage() {
                 borderRadius: 'var(--radius-md)', border: `1px solid ${c.border}`, width: '100%',
             }}>
                 <div style={{ fontSize: '1.8rem', marginBottom: 6 }}>
-                    {paymentStatus === 'paid' ? <span className="pulse-icon">{c.icon}</span> : c.icon}
+                    {paymentStatus === 'utr_entry' ? <span className="pulse-icon">{c.icon}</span> : c.icon}
                 </div>
                 <p style={{ color: c.color, fontWeight: 700, fontSize: '1rem' }}>{c.label}</p>
                 <p style={{ color: 'var(--text-muted)', fontSize: '0.78rem', marginTop: 4 }}>{c.sub}</p>
@@ -333,12 +356,56 @@ function PaymentPage() {
                                     <button className="btn-outline" onClick={handleCopy}>{copied ? '✅ Copied' : '📋 Copy'}</button>
                                 </div>
 
-                                {/* "I've Paid" button */}
+                                {/* "I've Paid" button → leads to UTR entry */}
                                 {paymentStatus === 'pending' && (
-                                    <button className="btn-success" onClick={handleMarkPaid}
+                                    <button className="btn-success" onClick={handlePaidClick}
                                         style={{ width: '100%', justifyContent: 'center', padding: 14, fontSize: '1rem' }}>
                                         ✅ I've Completed the Payment
                                     </button>
+                                )}
+
+                                {/* UTR Entry Form */}
+                                {paymentStatus === 'utr_entry' && (
+                                    <div className="fade-in" style={{
+                                        width: '100%', display: 'flex', flexDirection: 'column', gap: 12,
+                                        padding: 16, background: 'rgba(79,70,229,0.04)',
+                                        borderRadius: 'var(--radius-md)', border: '1px solid rgba(79,70,229,0.15)',
+                                    }}>
+                                        <label style={{ fontSize: '0.82rem', color: 'var(--text-muted)', fontWeight: 600 }}>
+                                            Enter 12-digit UTR / UPI Reference Number
+                                        </label>
+                                        <input
+                                            type="text"
+                                            className="form-input"
+                                            placeholder="e.g. 412345678901"
+                                            maxLength={12}
+                                            value={utrInput}
+                                            onChange={e => setUtrInput(e.target.value.replace(/\D/g, '').slice(0, 12))}
+                                            style={{ textAlign: 'center', fontFamily: 'monospace', fontSize: '1.1rem', letterSpacing: 2 }}
+                                            autoFocus
+                                        />
+                                        <div style={{ display: 'flex', gap: 10 }}>
+                                            <button
+                                                className="btn-primary"
+                                                onClick={handleSubmitUtr}
+                                                disabled={submittingUtr}
+                                                style={{ flex: 1, justifyContent: 'center', padding: 12 }}
+                                            >
+                                                {submittingUtr ? '⏳ Verifying...' : '🎉 Confirm Payment'}
+                                            </button>
+                                            <button
+                                                className="btn-outline"
+                                                onClick={() => handleSubmitUtr()}
+                                                disabled={submittingUtr}
+                                                style={{ fontSize: '0.75rem', padding: '8px 12px', whiteSpace: 'nowrap' }}
+                                            >
+                                                Skip UTR
+                                            </button>
+                                        </div>
+                                        <p style={{ fontSize: '0.7rem', color: 'var(--text-muted)', textAlign: 'center', margin: 0 }}>
+                                            💡 Find UTR in your UPI app under transaction details
+                                        </p>
+                                    </div>
                                 )}
 
                                 {/* App badges */}
