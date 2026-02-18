@@ -1,214 +1,282 @@
+require("dotenv").config();
 const express = require("express");
 const cors = require("cors");
-require("dotenv").config();
-const Participant = require("./user.model");
-const UUID = require("uuid-int");
-const axios = require("axios");
+const fs = require("fs");
+const path = require("path");
+const PaytmScraper = require("./paytm-scraper");
 
-const port = process.env.PORT || 8080;
-let app = express();
-
-app.use(express.json({ limit: "16mb", extended: true }));
-app.use(express.urlencoded({ limit: "16mb", extended: true }));
+const app = express();
 app.use(cors());
+app.use(express.json());
 
-const id = {};
+// ── JSON file storage ──
+const DATA_DIR = path.join(__dirname, "data");
+const TXN_FILE = path.join(DATA_DIR, "transactions.json");
 
-const mongoose = require("mongoose");
-const connectionOptions = {
-	useNewUrlParser: true,
-	useUnifiedTopology: true,
-};
+if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
+if (!fs.existsSync(TXN_FILE)) fs.writeFileSync(TXN_FILE, "[]");
 
-mongoose.connect(
-	process.env.connectionString,
-	connectionOptions,
-);
-mongoose.Promise = global.Promise;
+function readTxns() {
+    try { return JSON.parse(fs.readFileSync(TXN_FILE, "utf8")); }
+    catch { return []; }
+}
 
-app.get("/",function(request,response){
-    response.send("UPI Payment Gateway")
+function writeTxns(txns) {
+    fs.writeFileSync(TXN_FILE, JSON.stringify(txns, null, 2));
+}
+
+// ── Paytm Scraper ──
+const scraper = new PaytmScraper();
+let pollingInterval = null;
+
+// ═══════════════════════════════════════
+//  ORDER ENDPOINTS
+// ═══════════════════════════════════════
+
+// 1. Create Order
+app.post("/api/create-order", (req, res) => {
+    const { amount, note } = req.body;
+    if (!amount || Number(amount) <= 0) {
+        return res.status(400).json({ error: "Invalid amount" });
+    }
+
+    const orderId = "ORD_" + Date.now() + "_" + Math.random().toString(36).slice(2, 6);
+    const txns = readTxns();
+
+    txns.unshift({
+        orderId,
+        amount: Number(amount),
+        note: note || "",
+        status: "pending",
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+    });
+
+    if (txns.length > 500) txns.length = 500;
+    writeTxns(txns);
+
+    res.json({ success: true, orderId, amount: Number(amount) });
 });
 
-function formatDate(date, format) {
-    const ISTOptions = {
-        timeZone: 'Asia/Kolkata',
-        year: 'numeric',
-        month: '2-digit',
-        day: '2-digit',
-        hour: '2-digit',
-        minute: '2-digit',
-        second: '2-digit'
-    };
-
-    const ISTDate = date.toLocaleString('en-IN', ISTOptions);
-    
-    const map = {
-        mm: ISTDate.slice(3, 5),
-        dd: ISTDate.slice(0, 2),
-        yy: ISTDate.slice(8, 10),
-        yyyy: ISTDate.slice(6, 10)
-    };
-    
-    return format.replace(/dd|mm|yyyy/gi, (matched) => map[matched]);
-}
-
-function stringToDate(dateString) {
-    // Split the string into day, month, and year components
-    const [day, month, year] = dateString.split('-').map(Number);
-
-    // Create a new Date object with the components
-    const date = new Date(year, month - 1, day); // month is 0-based in JavaScript Date objects
-
-    // Set the time zone to Indian Standard Time (IST)
-    date.setTime(date.getTime() + (5.5 * 60 * 60 * 1000)); // 5.5 hours ahead for IST (5 hours + 30 minutes)
-
-    return date;
-}
-
-String.prototype.shuffle = function () {
-	let a = this.split(""),
-		n = a.length;
-
-	for (let i = n - 1; i > 0; i--) {
-		let j = Math.floor(Math.random() * (i + 1));
-		let tmp = a[i];
-		a[i] = a[j];
-		a[j] = tmp;
-	}
-	return a.join("");
-}
-
-async function checkPayment(client_txn_id, txn_date, user) {
-	
-	await axios
-		.post("https://merchant.upigateway.com/api/check_order_status", {
-			client_txn_id,
-			txn_date,
-			key: process.env.merchant_key,
-		})
-		.then((res) => {
-			const data = res.data;
-			if (data.status === true) {
-				const info = data.data;
-				if (info.status === "success") {
-					clearInterval(id[client_txn_id].id);
-					user.client_txn_id = data.data.client_txn_id;
-                    user.upi_txn_id = data.data.upi_txn_id;
-					user.amount = data.data.amount;
-                    user.status = true;
-					user.txn_date = stringToDate(txn_date);
-					create(user);
-					delete id[client_txn_id];
-				} else if (info.status === "failure" || id[client_txn_id].time >= 100) {
-					clearInterval(id[client_txn_id].id);
-					user.client_txn_id = data.data.client_txn_id;
-                    user.upi_txn_id = data.data.upi_txn_id;
-					user.amount = data.data.amount;
-                    user.status = false;
-					user.txn_date = stringToDate(txn_date);
-					create(user);
-					delete id[client_txn_id];
-				} else {
-					id[client_txn_id].time++;
-				}
-			}
-			return res.data;
-		})
-		.catch((e) => {
-			console.log(e);
-		});
-}
-
-async function create(user) {
-	try {
-		const participant = new Participant(user);
-        await participant.save();
-		return true;
-	} catch (e) {
-		console.log(e);
-		return { err: "something went wrong" };
-	}
-}
-
-app.post("/pay",async function (req, res, next) {
-    let payload = req.body.payload;
-	payload["key"] = process.env.merchant_key;
-	payload["client_txn_id"] = UUID(0).uuid().toString().shuffle();
-	payload["p_info"] = "UPI Payment Gateway";
-	payload["redirect_url"] = process.env.fronted_url;
-	// payload["udf1"] = "user defined field 1 (max 25 char)";
-	// payload["udf2"] = "user defined field 2 (max 25 char)";
-	// payload["udf3"] = "user defined field 3 (max 25 char)";
-
-	let user = {
-		name: payload.customer_name,
-		email: payload.customer_email,
-		mobileNo: payload.customer_mobile,
-	};
-
-    id[payload["client_txn_id"]] = { time: 0 };
-	id[payload["client_txn_id"]].id = setInterval(
-		async () =>
-			await checkPayment(
-				payload["client_txn_id"],
-				formatDate(new Date(Date.now()), "dd-mm-yyyy"),
-				user,
-			),
-		3000,
-	);
-
-	let response = await axios
-		.post("https://merchant.upigateway.com/api/create_order", payload)
-		.then((res) => {
-			return res.data;
-		})
-		.catch((e) => {
-			console.log(e);
-			return e;
-		});
-
-	res.json(response);
+// 2. Check order status (customer polls this)
+app.get("/api/check-status/:orderId", (req, res) => {
+    const txns = readTxns();
+    const txn = txns.find(t => t.orderId === req.params.orderId);
+    if (!txn) return res.status(404).json({ error: "Order not found" });
+    res.json({ success: true, orderId: txn.orderId, status: txn.status, amount: txn.amount });
 });
 
-app.post("/payCheck",async function (req, res, next) {
-	let payload = req.body;
-
-	if(!payload.client_txn_id || payload.client_txn_id === null) {
-		return res.json({ status: false });
-	}
-
-	payload["key"] = process.env.merchant_key;
-	
-    let user = (
-		await Participant.find({ client_txn_id: payload.client_txn_id })
-	)[0];
-
-	if (!user) {
-		return res.json({ status: false });
-	}
-    
-	payload["txn_date"] = formatDate(user.txn_date, "dd-mm-yyyy");
-	
-	let response = await axios
-		.post("https://merchant.upigateway.com/api/check_order_status", payload)
-		.then((res) => {
-			return res.data;
-		})
-		.catch((e) => {
-			console.log(e);
-		});
-
-	response["user"] = user;
-
-	res.json(response);
+// 3. Admin manually confirms/rejects (fallback)
+app.post("/api/update-status/:orderId", (req, res) => {
+    const { status } = req.body;
+    if (!["confirmed", "rejected"].includes(status)) {
+        return res.status(400).json({ error: "Status must be 'confirmed' or 'rejected'" });
+    }
+    const txns = readTxns();
+    const txn = txns.find(t => t.orderId === req.params.orderId);
+    if (!txn) return res.status(404).json({ error: "Order not found" });
+    txn.status = status;
+    txn.updatedAt = new Date().toISOString();
+    writeTxns(txns);
+    res.json({ success: true, status: txn.status });
 });
 
-app.get("/getAllUser", async function(req, res, next) {
-	let response = await Participant.find({}).sort({'txn_date': -1});
-	res.json(response);
+// 4. Get all transactions
+app.get("/api/transactions", (req, res) => {
+    res.json({ success: true, transactions: readTxns() });
 });
 
-app.listen(port, function () {
-    console.log("Started application on port %d", port)
+// 5. Delete one
+app.delete("/api/transactions/:orderId", (req, res) => {
+    const txns = readTxns().filter(t => t.orderId !== req.params.orderId);
+    writeTxns(txns);
+    res.json({ success: true });
+});
+
+// 6. Clear all
+app.delete("/api/transactions", (req, res) => {
+    writeTxns([]);
+    res.json({ success: true });
+});
+
+// ═══════════════════════════════════════
+//  PAYTM SCRAPER ENDPOINTS
+// ═══════════════════════════════════════
+
+// 7. Start Paytm QR login — returns QR image to display
+app.post("/api/paytm/start-qr-login", async (req, res) => {
+    console.log("📱 Starting Paytm QR login...");
+    try {
+        const result = await scraper.startQRLogin();
+        res.json(result);
+    } catch (err) {
+        res.json({ success: false, error: err.message });
+    }
+});
+
+// 8. Check if QR was scanned (poll this)
+app.get("/api/paytm/check-login", async (req, res) => {
+    try {
+        const result = await scraper.checkLoginComplete();
+        if (result.loggedIn) {
+            startPassbookPolling();
+        }
+        res.json(result);
+    } catch (err) {
+        res.json({ success: false, loggedIn: false, error: err.message });
+    }
+});
+
+// 9. Get current QR code (refresh)
+app.get("/api/paytm/get-qr", async (req, res) => {
+    try {
+        const result = await scraper.getQRCode();
+        res.json(result);
+    } catch (err) {
+        res.json({ success: false, error: err.message });
+    }
+});
+
+// 9. Get Paytm session status
+app.get("/api/paytm/status", (req, res) => {
+    const status = scraper.getStatus();
+    res.json({ success: true, ...status });
+});
+
+// 10. Manually trigger a passbook check
+app.post("/api/paytm/check-now", async (req, res) => {
+    console.log("🔍 Manual passbook check...");
+    const result = await checkAndMatchPassbook();
+    res.json(result);
+});
+
+// 11. Disconnect Paytm
+app.post("/api/paytm/disconnect", async (req, res) => {
+    stopPassbookPolling();
+    await scraper.close();
+    scraper.isLoggedIn = false;
+    scraper.loginInProgress = false;
+    scraper.saveSession({ status: "disconnected", disconnectedAt: new Date().toISOString() });
+
+    // Clean up cookie files
+    const cookiesFile = path.join(DATA_DIR, "paytm-cookies.json");
+    if (fs.existsSync(cookiesFile)) fs.unlinkSync(cookiesFile);
+
+    console.log("🔌 Paytm disconnected");
+    res.json({ success: true, message: "Paytm disconnected" });
+});
+
+// ═══════════════════════════════════════
+//  BACKGROUND PASSBOOK POLLING
+// ═══════════════════════════════════════
+
+async function checkAndMatchPassbook() {
+    try {
+        const passbookResult = await scraper.checkPassbook();
+
+        if (!passbookResult.success) {
+            console.log("❌ Passbook check failed:", passbookResult.error);
+            return passbookResult;
+        }
+
+        const credits = passbookResult.transactions.filter(t => t.isCredit);
+        if (credits.length === 0) {
+            return { success: true, matches: 0, message: "No credits found" };
+        }
+
+        // Get pending orders
+        const txns = readTxns();
+        const pending = txns.filter(t => t.status === "pending");
+
+        if (pending.length === 0) {
+            return { success: true, matches: 0, message: "No pending orders" };
+        }
+
+        // Match credits to pending orders
+        const matches = scraper.matchPayments(credits, pending);
+
+        if (matches.length > 0) {
+            // Auto-confirm matched orders
+            for (const match of matches) {
+                const txn = txns.find(t => t.orderId === match.orderId);
+                if (txn) {
+                    txn.status = "confirmed";
+                    txn.confirmedBy = "paytm-auto";
+                    txn.matchedTransaction = match.matchedTransaction;
+                    txn.updatedAt = new Date().toISOString();
+                    console.log(`✅ Auto-confirmed: ${match.orderId} (₹${match.amount})`);
+                }
+            }
+            writeTxns(txns);
+        }
+
+        return {
+            success: true,
+            matches: matches.length,
+            totalCredits: credits.length,
+            checkedAt: passbookResult.checkedAt,
+        };
+    } catch (err) {
+        console.error("Passbook polling error:", err.message);
+        return { success: false, error: err.message };
+    }
+}
+
+function startPassbookPolling() {
+    if (pollingInterval) clearInterval(pollingInterval);
+
+    console.log("🔄 Started passbook polling (every 10s)");
+
+    pollingInterval = setInterval(async () => {
+        if (!scraper.isLoggedIn) {
+            console.log("⚠️ Paytm not logged in, stopping polling");
+            stopPassbookPolling();
+            return;
+        }
+
+        const txns = readTxns();
+        const hasPending = txns.some(t => t.status === "pending");
+
+        if (hasPending) {
+            await checkAndMatchPassbook();
+        }
+    }, 10000); // Every 10 seconds
+}
+
+function stopPassbookPolling() {
+    if (pollingInterval) {
+        clearInterval(pollingInterval);
+        pollingInterval = null;
+        console.log("⏹️ Stopped passbook polling");
+    }
+}
+
+// ── On startup, check if we have a saved session ──
+(async () => {
+    const session = scraper.loadSession();
+    if (session && session.status === "connected") {
+        console.log("📦 Found saved session, checking if still valid...");
+        const isValid = await scraper.checkSession();
+        if (isValid) {
+            console.log("✅ Saved Paytm session is still valid!");
+            startPassbookPolling();
+        } else {
+            console.log("⚠️ Saved session expired, login again from dashboard");
+        }
+    }
+})();
+
+// ── Start server ──
+const PORT = process.env.PORT || 10000;
+app.listen(PORT, () => {
+    console.log(`\n🚀 PayQR Server running on http://localhost:${PORT}`);
+    console.log(`📂 Data stored in: ${DATA_DIR}`);
+    console.log(`🔑 No merchant account needed!\n`);
+});
+
+// Cleanup on exit
+process.on("SIGINT", async () => {
+    stopPassbookPolling();
+    await scraper.close();
+    process.exit(0);
 });
