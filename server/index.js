@@ -150,6 +150,54 @@ app.post("/api/paytm/check-now", async (req, res) => {
     res.json(result);
 });
 
+// 11. SMS Webhook — The Reliable Way 🚀
+// App: "SMS to URL Forwarder" (Android) -> POST to this URL
+app.post("/api/paytm/sms-webhook", (req, res) => {
+    try {
+        const { body, from, content } = req.body; // Adapt based on app's payload
+        const msg = body || content || "";
+
+        console.log(`📩 Received SMS from ${from}: ${msg}`);
+
+        // 1. Extract Amount (Matches: Rs. 100, INR 100, ₹100.00)
+        const amtMatch = msg.match(/(?:Rs\.?|INR|₹)\s*([\d,]+(?:\.\d{2})?)/i);
+
+        // 2. Extract 12-digit Ref/UTR (Matches: UPI Ref 123..., UTR: 123...)
+        const refMatch = msg.match(/(?:UPI|Ref\.?|UTR|No\.?|Id)\s*[:\-]?\s*(\d{12})/i);
+
+        if (amtMatch && refMatch) {
+            const amount = parseFloat(amtMatch[1].replace(/,/g, ''));
+            const upiRef = refMatch[1];
+
+            console.log(`✅ Parsed: ₹${amount} | Ref: ${upiRef}`);
+
+            // Find matching pending order
+            const txns = readTxns();
+            const order = txns.find(t =>
+                t.status === 'pending' &&
+                Math.abs(t.amount - amount) < 1.0
+            );
+
+            if (order) {
+                console.log(`🎉 MATCH FOUND! Auto-confirming Order ${order.orderId}`);
+                order.status = 'confirmed';
+                order.confirmedBy = 'sms-webhook';
+                order.upiRef = upiRef;
+                order.confirmedAt = new Date().toISOString();
+                writeTxns(txns);
+                return res.json({ success: true, message: "Payment auto-confirmed" });
+            }
+        } else {
+            console.log("⚠️ Could not parse payment details from SMS");
+        }
+
+        res.json({ success: true, message: "SMS received" });
+    } catch (err) {
+        console.error("Webhook Error:", err);
+        res.status(500).json({ error: err.message });
+    }
+});
+
 // 11. Disconnect Paytm
 app.post("/api/paytm/disconnect", async (req, res) => {
     stopPassbookPolling();
