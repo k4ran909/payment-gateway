@@ -7,8 +7,16 @@ const COOKIES_FILE = path.join(DATA_DIR, "paytm-cookies.json");
 const SESSION_FILE = path.join(DATA_DIR, "paytm-session.json");
 
 const PAYTM_LOGIN_URL = "https://paytm.com/login";
-const PAYTM_PASSBOOK_URL = "https://paytm.com/passbook";
 const PAYTM_HOME = "https://paytm.com";
+
+// Known Paytm internal API endpoints for passbook/transaction history
+const PAYTM_API_URLS = [
+    "https://paytm.com/papi/v1/passbook",
+    "https://paytm.com/papi/v2/passbook",
+    "https://paytm.com/papi/passbook/txn-history",
+    "https://paytm.com/bpay/api/v1/passbook/transaction/list",
+    "https://paytm.com/bpay/api/v1/passbook",
+];
 
 const delay = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -19,6 +27,7 @@ class PaytmScraper {
         this.isLoggedIn = false;
         this.loginInProgress = false;
         this.lastCheckedTxns = [];
+        this.discoveredApiUrls = []; // URLs captured during login/navigation
     }
 
     // ── Launch browser ──
@@ -52,36 +61,49 @@ class PaytmScraper {
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
         );
         await this.loadCookies();
+
+        // Intercept network to discover Paytm's internal API endpoints
+        this.page.on('response', (response) => {
+            const url = response.url();
+            if (url.includes('passbook') || url.includes('txn') || url.includes('transaction')) {
+                if (!this.discoveredApiUrls.includes(url)) {
+                    this.discoveredApiUrls.push(url);
+                    console.log(`🔍 Discovered API: ${url}`);
+                }
+            }
+        });
     }
 
     // ── Cookie persistence ──
     async saveCookies() {
-        if (!this.page) return;
         try {
             const cookies = await this.page.cookies();
-            if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
             fs.writeFileSync(COOKIES_FILE, JSON.stringify(cookies, null, 2));
-        } catch (err) { console.error("Save cookies error:", err.message); }
+        } catch (err) {
+            console.error("Failed to save cookies:", err.message);
+        }
     }
 
     async loadCookies() {
-        if (!this.page) return;
         try {
             if (fs.existsSync(COOKIES_FILE)) {
                 const cookies = JSON.parse(fs.readFileSync(COOKIES_FILE, "utf8"));
                 if (cookies.length > 0) {
                     await this.page.setCookie(...cookies);
-                    console.log(`📦 Loaded ${cookies.length} saved cookies`);
+                    console.log(`🍪 Loaded ${cookies.length} saved cookies`);
                 }
             }
-        } catch (err) { console.error("Load cookies error:", err.message); }
+        } catch (err) {
+            console.error("Failed to load cookies:", err.message);
+        }
     }
 
     saveSession(data) {
         try {
-            if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
             fs.writeFileSync(SESSION_FILE, JSON.stringify(data, null, 2));
-        } catch { }
+        } catch (err) {
+            console.error("Failed to save session:", err.message);
+        }
     }
 
     loadSession() {
@@ -121,42 +143,26 @@ class PaytmScraper {
         }
     }
 
-    // ══════════════════════════════════════
-    //  QR CODE LOGIN FLOW
-    //  Paytm web login shows a QR code that
-    //  you scan with the Paytm app.
-    // ══════════════════════════════════════
-
+    // ── QR Login ──
     // Step 1: Open login page, extract the QR code image as base64
     async startQRLogin() {
         if (this.loginInProgress) {
-            // Return existing QR if still on login page
-            return await this.getQRCode();
+            return { success: false, error: "Login already in progress" };
         }
-
         this.loginInProgress = true;
 
         try {
             await this.launch();
-            console.log("🔄 Opening Paytm login page...");
+            await this.page.goto(PAYTM_LOGIN_URL, { waitUntil: "networkidle2", timeout: 30000 });
+            await delay(2000);
 
-            await this.page.goto(PAYTM_LOGIN_URL, { waitUntil: "networkidle2", timeout: 25000 });
-            await delay(3000);
-
-            // Take debug screenshot
-            await this.page.screenshot({ path: path.join(DATA_DIR, "login-page.png") });
-
-            // Extract the QR code
             const qrResult = await this.extractQR();
+            if (qrResult.success) {
+                return qrResult;
+            }
 
-            this.saveSession({
-                loginStarted: new Date().toISOString(),
-                status: "awaiting_scan",
-            });
-
-            return qrResult;
+            return { success: false, error: "Could not find QR code on login page" };
         } catch (err) {
-            console.error("QR login start error:", err.message);
             this.loginInProgress = false;
             return { success: false, error: err.message };
         }
@@ -165,99 +171,72 @@ class PaytmScraper {
     // Extract QR code image from the login page
     async extractQR() {
         try {
-            if (!this.page) return { success: false, error: "No page open" };
+            // Wait for QR to appear
+            const qrSelectors = [
+                'img[src*="qr"]', 'img[alt*="QR"]', 'img[alt*="qr"]',
+                'canvas', '[class*="qr" i] img', '[class*="qr" i] canvas',
+                '[data-testid*="qr" i]', 'img[src*="authenticator"]',
+            ];
 
-            // Try to find the QR code image element
-            const qrBase64 = await this.page.evaluate(() => {
-                // Look for QR code images
-                const imgs = document.querySelectorAll("img");
-                for (const img of imgs) {
-                    const src = img.src || "";
-                    const alt = (img.alt || "").toLowerCase();
-                    const cls = (img.className || "").toLowerCase();
-                    const w = img.offsetWidth || img.naturalWidth || 0;
-                    const h = img.offsetHeight || img.naturalHeight || 0;
+            let qrImage = null;
 
-                    // QR codes are usually square images, ~150-400px
-                    const isSquarish = w > 100 && h > 100 && Math.abs(w - h) < 50;
-                    const isQR =
-                        src.includes("qr") || alt.includes("qr") || cls.includes("qr") ||
-                        src.includes("data:image") || isSquarish;
+            for (const selector of qrSelectors) {
+                try {
+                    const el = await this.page.$(selector);
+                    if (el) {
+                        const tagName = await el.evaluate(e => e.tagName.toLowerCase());
 
-                    if (isQR && src) {
-                        // If it's already a data URL, return it
-                        if (src.startsWith("data:image")) return src;
-
-                        // Try to convert to base64 via canvas
-                        try {
-                            const canvas = document.createElement("canvas");
-                            canvas.width = img.naturalWidth || w;
-                            canvas.height = img.naturalHeight || h;
-                            const ctx = canvas.getContext("2d");
-                            ctx.drawImage(img, 0, 0);
-                            return canvas.toDataURL("image/png");
-                        } catch {
-                            return src; // Return URL if canvas fails (CORS)
+                        if (tagName === 'canvas') {
+                            qrImage = await el.evaluate(canvas => canvas.toDataURL('image/png'));
+                        } else if (tagName === 'img') {
+                            const src = await el.evaluate(img => img.src);
+                            if (src && (src.startsWith('data:') || src.includes('qr'))) {
+                                if (src.startsWith('data:')) {
+                                    qrImage = src;
+                                } else {
+                                    qrImage = await el.screenshot({ encoding: 'base64' });
+                                    qrImage = `data:image/png;base64,${qrImage}`;
+                                }
+                            }
                         }
+
+                        if (qrImage) break;
                     }
-                }
-
-                // Also check for SVG QR codes
-                const svgs = document.querySelectorAll("svg");
-                for (const svg of svgs) {
-                    const w = svg.offsetWidth || 0;
-                    const h = svg.offsetHeight || 0;
-                    if (w > 100 && h > 100 && Math.abs(w - h) < 50) {
-                        // Convert SVG to data URL
-                        const serializer = new XMLSerializer();
-                        const svgStr = serializer.serializeToString(svg);
-                        return "data:image/svg+xml;base64," + btoa(svgStr);
-                    }
-                }
-
-                // Check for canvas-based QR
-                const canvases = document.querySelectorAll("canvas");
-                for (const canvas of canvases) {
-                    const w = canvas.width || 0;
-                    const h = canvas.height || 0;
-                    if (w > 100 && h > 100 && Math.abs(w - h) < 50) {
-                        try { return canvas.toDataURL("image/png"); } catch { }
-                    }
-                }
-
-                return null;
-            });
-
-            if (qrBase64) {
-                console.log("✅ QR code extracted from Paytm login page");
-                return { success: true, qrImage: qrBase64 };
+                } catch { }
             }
 
-            // Fallback: screenshot just the QR area
-            console.log("⚠️ Could not extract QR element, taking full page screenshot");
-            const screenshotBuffer = await this.page.screenshot({ encoding: "base64" });
-            return {
-                success: true,
-                qrImage: "data:image/png;base64," + screenshotBuffer,
-                fallback: true,
-            };
+            // Fallback: screenshot the QR area
+            if (!qrImage) {
+                await this.page.screenshot({ path: path.join(DATA_DIR, "login-page.png") });
+
+                try {
+                    const qrContainer = await this.page.$('[class*="qr" i], [class*="scan" i], [class*="barcode" i]');
+                    if (qrContainer) {
+                        const screenshot = await qrContainer.screenshot({ encoding: 'base64' });
+                        qrImage = `data:image/png;base64,${screenshot}`;
+                    }
+                } catch { }
+            }
+
+            // Last resort: take full page screenshot
+            if (!qrImage) {
+                const fullScreenshot = await this.page.screenshot({ encoding: 'base64', fullPage: true });
+                qrImage = `data:image/png;base64,${fullScreenshot}`;
+            }
+
+            return { success: true, qrImage };
         } catch (err) {
-            console.error("QR extract error:", err.message);
             return { success: false, error: err.message };
         }
     }
 
     // Get current QR (re-extract from page)
     async getQRCode() {
-        try {
-            if (!this.page) return { success: false, error: "No login page open" };
-            return await this.extractQR();
-        } catch (err) {
-            return { success: false, error: err.message };
-        }
+        if (!this.page) return { success: false, error: "No page open" };
+        return this.extractQR();
     }
 
-    // Step 2: Check if QR scan completed (user scanned with Paytm app)
+    // Step 2: Check if QR scan completed
     async checkLoginComplete() {
         try {
             if (!this.page) return { success: false, loggedIn: false, error: "No page open" };
@@ -265,10 +244,8 @@ class PaytmScraper {
             const url = this.page.url();
             const content = await this.page.content();
 
-            // Take debug screenshot
             await this.page.screenshot({ path: path.join(DATA_DIR, "login-check.png") });
 
-            // If we're no longer on the login page, login succeeded!
             const stillOnLogin = url.includes("/login") || url.includes("/signin");
             const hasLoggedInIndicators =
                 content.includes("passbook") || content.includes("Passbook") ||
@@ -294,10 +271,9 @@ class PaytmScraper {
         }
     }
 
-    // ══════════════════════════════════════
-    //  PASSBOOK SCRAPING
-    // ══════════════════════════════════════
-
+    // ═══════════════════════════════════════════════
+    //  FIXED: Check passbook WITHOUT navigating away
+    // ═══════════════════════════════════════════════
     async checkPassbook() {
         if (!this.isLoggedIn) {
             return { success: false, error: "Not logged in", transactions: [] };
@@ -305,83 +281,202 @@ class PaytmScraper {
 
         try {
             await this.launch();
-            await this.page.goto(PAYTM_PASSBOOK_URL, { waitUntil: "networkidle2", timeout: 20000 });
-            await delay(3000);
 
-            const url = this.page.url();
-            if (url.includes("/login") || url.includes("/signin")) {
-                this.isLoggedIn = false;
-                this.saveSession({ status: "disconnected", expiredAt: new Date().toISOString() });
-                return { success: false, error: "Session expired", transactions: [] };
+            // Strategy 1: Use page.evaluate to call Paytm's internal APIs
+            // This stays on the same page, keeping the session alive
+            const allApiUrls = [...this.discoveredApiUrls, ...PAYTM_API_URLS];
+
+            for (const apiUrl of allApiUrls) {
+                try {
+                    console.log(`🔍 Trying API: ${apiUrl}`);
+                    const result = await this.page.evaluate(async (url) => {
+                        try {
+                            const res = await fetch(url, {
+                                method: 'GET',
+                                credentials: 'include',
+                                headers: {
+                                    'Accept': 'application/json',
+                                    'Content-Type': 'application/json',
+                                },
+                            });
+                            if (!res.ok) return { ok: false, status: res.status };
+                            const data = await res.json();
+                            return { ok: true, data };
+                        } catch (err) {
+                            return { ok: false, error: err.message };
+                        }
+                    }, apiUrl);
+
+                    if (result.ok && result.data) {
+                        console.log(`✅ API returned data from: ${apiUrl}`);
+                        const transactions = this.parseApiResponse(result.data);
+                        if (transactions.length > 0) {
+                            this.lastCheckedTxns = transactions;
+                            return { success: true, transactions, source: 'api', checkedAt: new Date().toISOString() };
+                        }
+                    }
+                } catch (err) {
+                    console.log(`❌ API failed: ${apiUrl} — ${err.message}`);
+                }
             }
 
-            await this.page.screenshot({ path: path.join(DATA_DIR, "passbook.png") });
+            // Strategy 2: Try POST variants with common payloads
+            for (const apiUrl of PAYTM_API_URLS) {
+                try {
+                    const result = await this.page.evaluate(async (url) => {
+                        try {
+                            const res = await fetch(url, {
+                                method: 'POST',
+                                credentials: 'include',
+                                headers: {
+                                    'Accept': 'application/json',
+                                    'Content-Type': 'application/json',
+                                },
+                                body: JSON.stringify({
+                                    pageSize: 20,
+                                    pageNumber: 0,
+                                    type: "CREDIT",
+                                }),
+                            });
+                            if (!res.ok) return { ok: false, status: res.status };
+                            const data = await res.json();
+                            return { ok: true, data };
+                        } catch (err) {
+                            return { ok: false, error: err.message };
+                        }
+                    }, apiUrl);
 
-            const transactions = await this.page.evaluate(() => {
-                const txns = [];
-                const selectors = [
-                    '[class*="transaction" i]', '[class*="txn" i]',
-                    '[class*="passbook" i] li', '[class*="passbook" i] [class*="item" i]',
-                    '[class*="history" i] li', '[class*="list" i] [class*="item" i]',
-                    'table tbody tr', '[data-testid*="transaction" i]',
-                ];
-
-                for (const selector of selectors) {
-                    const elements = document.querySelectorAll(selector);
-                    if (elements.length > 0) {
-                        elements.forEach((el) => {
-                            const text = el.innerText || el.textContent || "";
-                            const amountMatch = text.match(/[₹Rs.]*\s*([\d,]+\.?\d*)/);
-                            const amount = amountMatch ? parseFloat(amountMatch[1].replace(/,/g, "")) : 0;
-                            const isCredit =
-                                text.toLowerCase().includes("received") ||
-                                text.toLowerCase().includes("credited") ||
-                                text.toLowerCase().includes("credit") ||
-                                text.includes("+") ||
-                                text.toLowerCase().includes("from");
-
-                            if (amount > 0) {
-                                txns.push({
-                                    text: text.substring(0, 200), amount, isCredit,
-                                    timestamp: new Date().toISOString(),
-                                });
-                            }
-                        });
-                        if (txns.length > 0) break;
+                    if (result.ok && result.data) {
+                        console.log(`✅ POST API returned data from: ${apiUrl}`);
+                        const transactions = this.parseApiResponse(result.data);
+                        if (transactions.length > 0) {
+                            this.lastCheckedTxns = transactions;
+                            return { success: true, transactions, source: 'api-post', checkedAt: new Date().toISOString() };
+                        }
                     }
-                }
+                } catch { }
+            }
 
-                // Fallback: parse all visible text
-                if (txns.length === 0) {
-                    const bodyText = document.body.innerText || "";
-                    const lines = bodyText.split("\n").filter((l) => l.trim());
-                    for (const line of lines) {
-                        const amountMatch = line.match(/[₹Rs.]*\s*([\d,]+\.?\d*)/);
-                        if (amountMatch) {
-                            const amount = parseFloat(amountMatch[1].replace(/,/g, ""));
-                            if (amount > 0 && amount < 1000000) {
-                                const isCredit =
-                                    line.toLowerCase().includes("received") ||
-                                    line.toLowerCase().includes("credited") ||
-                                    line.toLowerCase().includes("credit") ||
-                                    line.includes("+");
-                                txns.push({
-                                    text: line.substring(0, 200), amount, isCredit,
-                                    timestamp: new Date().toISOString(),
-                                });
-                            }
+            // Strategy 3: Scrape the current page content for transaction data
+            // (Works if the home page shows recent transactions)
+            console.log("🔍 Fallback: scraping current page content...");
+            const pageTransactions = await this.scrapePageContent();
+            if (pageTransactions.length > 0) {
+                this.lastCheckedTxns = pageTransactions;
+                return { success: true, transactions: pageTransactions, source: 'page-scrape', checkedAt: new Date().toISOString() };
+            }
+
+            // Strategy 4: Navigate to passbook as last resort, but handle re-login gracefully
+            console.log("🔍 Last resort: navigating to passbook...");
+            try {
+                const passbookResult = await this.navigateAndScrapePassbook();
+                if (passbookResult.success && passbookResult.transactions.length > 0) {
+                    return passbookResult;
+                }
+            } catch (err) {
+                console.log(`❌ Passbook navigation failed: ${err.message}`);
+            }
+
+            return { success: true, transactions: [], source: 'no-data', checkedAt: new Date().toISOString() };
+        } catch (err) {
+            console.error("Passbook check error:", err.message);
+            return { success: false, error: err.message, transactions: [] };
+        }
+    }
+
+    // Parse various Paytm API response formats
+    parseApiResponse(data) {
+        const transactions = [];
+
+        // Try common response formats
+        const txnArrays = [
+            data.transactions, data.data, data.transactionList,
+            data.result?.transactions, data.result?.data,
+            data.body?.transactions, data.body?.data,
+            data.response?.transactions,
+        ].filter(Boolean);
+
+        for (const arr of txnArrays) {
+            if (!Array.isArray(arr)) continue;
+            for (const t of arr) {
+                const amount = parseFloat(t.amount || t.txnAmount || t.transactionAmount || 0);
+                const isCredit = (t.type === 'CREDIT' || t.transactionType === 'CREDIT' ||
+                    t.status === 'CREDIT' || t.direction === 'CREDIT' ||
+                    (t.description || '').toLowerCase().includes('received') ||
+                    (t.description || '').toLowerCase().includes('credited'));
+
+                if (amount > 0) {
+                    transactions.push({
+                        amount,
+                        isCredit,
+                        text: t.description || t.narration || t.title || JSON.stringify(t).slice(0, 200),
+                        timestamp: t.timestamp || t.date || t.createdAt || new Date().toISOString(),
+                        ref: t.transactionId || t.txnId || t.utr || t.refId || '',
+                    });
+                }
+            }
+        }
+
+        return transactions;
+    }
+
+    // Scrape the current page without navigating
+    async scrapePageContent() {
+        try {
+            return await this.page.evaluate(() => {
+                const txns = [];
+                const bodyText = document.body.innerText || "";
+                const lines = bodyText.split("\n").filter(l => l.trim());
+
+                for (const line of lines) {
+                    const amountMatch = line.match(/[₹Rs.]*\s*([\d,]+\.?\d*)/);
+                    if (amountMatch) {
+                        const amount = parseFloat(amountMatch[1].replace(/,/g, ""));
+                        if (amount > 0 && amount < 1000000) {
+                            const isCredit =
+                                line.toLowerCase().includes("received") ||
+                                line.toLowerCase().includes("credited") ||
+                                line.toLowerCase().includes("credit") ||
+                                line.includes("+");
+                            txns.push({
+                                text: line.substring(0, 200), amount, isCredit,
+                                timestamp: new Date().toISOString(),
+                            });
                         }
                     }
                 }
-
                 return txns;
             });
+        } catch { return []; }
+    }
 
+    // Navigate to passbook (last resort — may break session)
+    async navigateAndScrapePassbook() {
+        try {
+            // Save current URL to go back
+            const currentUrl = this.page.url();
+
+            await this.page.goto("https://paytm.com/passbook", { waitUntil: "networkidle2", timeout: 15000 });
+            await delay(2000);
+
+            const url = this.page.url();
+            if (url.includes("/login") || url.includes("/signin")) {
+                // Session died — go back and mark as disconnected
+                this.isLoggedIn = false;
+                this.saveSession({ status: "disconnected", expiredAt: new Date().toISOString() });
+                // Try to go back to maintain whatever session might be left
+                try { await this.page.goto(currentUrl, { waitUntil: "networkidle2", timeout: 10000 }); } catch { }
+                return { success: false, error: "Session expired", transactions: [] };
+            }
+
+            const transactions = await this.scrapePageContent();
             await this.saveCookies();
-            this.lastCheckedTxns = transactions;
-            return { success: true, transactions, checkedAt: new Date().toISOString() };
+
+            // Go back to home to keep session alive for future checks
+            try { await this.page.goto(PAYTM_HOME, { waitUntil: "networkidle2", timeout: 10000 }); } catch { }
+
+            return { success: true, transactions, source: 'passbook-page', checkedAt: new Date().toISOString() };
         } catch (err) {
-            console.error("Passbook check error:", err.message);
             return { success: false, error: err.message, transactions: [] };
         }
     }
@@ -389,15 +484,17 @@ class PaytmScraper {
     // Match passbook credits to pending orders
     matchPayments(passbookCredits, pendingOrders) {
         const matches = [];
+        const credits = passbookCredits.filter(t => t.isCredit);
+
         for (const order of pendingOrders) {
-            const match = passbookCredits.find(
-                (c) => c.isCredit && Math.abs(c.amount - order.amount) < 0.01
+            const match = credits.find(c =>
+                Math.abs(c.amount - order.amount) < 1.0
             );
             if (match) {
                 matches.push({
                     orderId: order.orderId,
                     amount: order.amount,
-                    matchedTransaction: match.text,
+                    matchedTransaction: match,
                 });
             }
         }
@@ -406,22 +503,23 @@ class PaytmScraper {
 
     // Session status
     getStatus() {
-        const session = this.loadSession();
         return {
             isLoggedIn: this.isLoggedIn,
             loginInProgress: this.loginInProgress,
-            session: session || { status: "disconnected" },
+            lastCheckedTxns: this.lastCheckedTxns.length,
+            discoveredApis: this.discoveredApiUrls.length,
         };
     }
 
     // Cleanup
     async close() {
-        this.loginInProgress = false;
-        if (this.browser) {
-            try { await this.browser.close(); } catch { }
-            this.browser = null;
-            this.page = null;
-        }
+        try {
+            if (this.browser) {
+                await this.browser.close();
+                this.browser = null;
+                this.page = null;
+            }
+        } catch { }
     }
 }
 

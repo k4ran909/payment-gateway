@@ -23,7 +23,7 @@ function PaymentPage() {
     const [order, setOrder] = useState(null);
     const [upiLink, setUpiLink] = useState('');
     const [paymentStatus, setPaymentStatus] = useState('idle');
-    // idle → pending (QR shown) → utr_entry (clicked "I've Paid") → confirmed
+    // idle → pending (QR shown) → utr_entry (clicked "I've Paid") → verifying → confirmed
     const [copied, setCopied] = useState(false);
     const [utrInput, setUtrInput] = useState('');
     const [submittingUtr, setSubmittingUtr] = useState(false);
@@ -81,7 +81,11 @@ function PaymentPage() {
                     clearInterval(pollingRef.current);
                     pollingRef.current = null;
                     setPaymentStatus('confirmed');
-                    showToast('✅ Payment confirmed!');
+                    showToast(data.confirmedBy === 'paytm-verified'
+                        ? '🤖 Payment verified by Paytm!'
+                        : '✅ Payment confirmed!');
+                } else if (data.status === 'verifying') {
+                    setPaymentStatus('verifying');
                 } else if (data.status === 'rejected') {
                     clearInterval(pollingRef.current);
                     pollingRef.current = null;
@@ -126,7 +130,7 @@ function PaymentPage() {
         setPaymentStatus('utr_entry');
     };
 
-    // Customer submits UTR → auto-confirm
+    // Customer submits UTR → goes to verifying (Paytm checks in background)
     const handleSubmitUtr = async () => {
         if (!order || !order.orderId || order.orderId === 'OFFLINE') {
             setPaymentStatus('confirmed');
@@ -143,9 +147,16 @@ function PaymentPage() {
             });
             const data = await res.json();
             if (data.success) {
-                setPaymentStatus('confirmed');
-                showToast('🎉 Payment confirmed! Thank you!');
-                if (pollingRef.current) { clearInterval(pollingRef.current); pollingRef.current = null; }
+                if (data.status === 'confirmed') {
+                    setPaymentStatus('confirmed');
+                    showToast('🎉 Payment confirmed!');
+                    if (pollingRef.current) { clearInterval(pollingRef.current); pollingRef.current = null; }
+                } else {
+                    // Server is verifying with Paytm — keep polling
+                    setPaymentStatus('verifying');
+                    showToast('🔍 Verifying payment with Paytm...');
+                    // Polling is already running from handleGenerate
+                }
             } else {
                 showToast('❌ ' + (data.error || 'Failed to confirm'));
             }
@@ -220,7 +231,8 @@ function PaymentPage() {
         const configs = {
             pending: { icon: '📲', label: 'Scan QR and pay', sub: 'After paying, click the button below to confirm', color: 'var(--accent-2)', bg: 'rgba(6,182,212,0.06)', border: 'rgba(6,182,212,0.15)' },
             utr_entry: { icon: '🔢', label: 'Enter Transaction Reference (UTR)', sub: 'Find the 12-digit UTR number in your UPI app after payment', color: 'var(--accent-1)', bg: 'rgba(79,70,229,0.06)', border: 'rgba(79,70,229,0.15)' },
-            confirmed: { icon: '🎉', label: 'Payment Confirmed!', sub: 'Thank you for your payment!', color: 'var(--success)', bg: 'rgba(16,185,129,0.06)', border: 'rgba(16,185,129,0.15)' },
+            verifying: { icon: '🔍', label: 'Verifying Payment...', sub: 'Checking with Paytm — this may take up to 60 seconds', color: 'var(--warning)', bg: 'rgba(245,158,11,0.06)', border: 'rgba(245,158,11,0.15)' },
+            confirmed: { icon: '🎉', label: 'Payment Confirmed!', sub: 'Verified by Paytm — Thank you!', color: 'var(--success)', bg: 'rgba(16,185,129,0.06)', border: 'rgba(16,185,129,0.15)' },
             rejected: { icon: '❌', label: 'Payment Rejected', sub: 'Please contact admin or try again', color: 'var(--error)', bg: 'rgba(239,68,68,0.06)', border: 'rgba(239,68,68,0.15)' },
         };
         const c = configs[paymentStatus];
@@ -232,7 +244,7 @@ function PaymentPage() {
                 borderRadius: 'var(--radius-md)', border: `1px solid ${c.border}`, width: '100%',
             }}>
                 <div style={{ fontSize: '1.8rem', marginBottom: 6 }}>
-                    {paymentStatus === 'utr_entry' ? <span className="pulse-icon">{c.icon}</span> : c.icon}
+                    {(paymentStatus === 'utr_entry' || paymentStatus === 'verifying') ? <span className="pulse-icon">{c.icon}</span> : c.icon}
                 </div>
                 <p style={{ color: c.color, fontWeight: 700, fontSize: '1rem' }}>{c.label}</p>
                 <p style={{ color: 'var(--text-muted)', fontSize: '0.78rem', marginTop: 4 }}>{c.sub}</p>
