@@ -28,6 +28,7 @@ function writeTxns(txns) {
 
 // ── Paytm Scraper Instance ──
 const scraper = new PaytmScraper();
+scraper.clearStaleState(); // Reset any leftover session from previous runs
 let verificationInterval = null;
 
 // ════════════════════════════════════

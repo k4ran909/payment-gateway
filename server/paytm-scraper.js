@@ -25,9 +25,10 @@ class PaytmScraper {
         this.browser = null;
         this.page = null;
         this.isLoggedIn = false;
+        this.sessionVerified = false; // Only true after active verification
         this.loginInProgress = false;
         this.lastCheckedTxns = [];
-        this.discoveredApiUrls = []; // URLs captured during login/navigation
+        this.discoveredApiUrls = [];
     }
 
     // ── Launch browser ──
@@ -125,6 +126,7 @@ class PaytmScraper {
 
             if (url.includes("/login") || url.includes("/signin")) {
                 this.isLoggedIn = false;
+                this.sessionVerified = false;
                 return false;
             }
 
@@ -134,13 +136,30 @@ class PaytmScraper {
                 content.includes("Hi ") || content.includes("profile");
 
             this.isLoggedIn = loggedIn;
-            if (loggedIn) await this.saveCookies();
+            this.sessionVerified = loggedIn;
+            if (loggedIn) {
+                await this.saveCookies();
+                console.log("✅ Paytm session verified - cookies are valid");
+            }
             return loggedIn;
         } catch (err) {
             console.error("Session check error:", err.message);
             this.isLoggedIn = false;
+            this.sessionVerified = false;
             return false;
         }
+    }
+
+    // Clear old session data so Dashboard doesn't falsely show Connected
+    clearStaleState() {
+        this.isLoggedIn = false;
+        this.sessionVerified = false;
+        this.loginInProgress = false;
+        // Delete old session file
+        try { if (fs.existsSync(SESSION_FILE)) fs.unlinkSync(SESSION_FILE); } catch { }
+        // Delete old cookies
+        try { if (fs.existsSync(COOKIES_FILE)) fs.unlinkSync(COOKIES_FILE); } catch { }
+        console.log("🧹 Cleared stale Paytm session data");
     }
 
     // ── QR Login ──
@@ -254,13 +273,14 @@ class PaytmScraper {
 
             if (!stillOnLogin || hasLoggedInIndicators) {
                 this.isLoggedIn = true;
+                this.sessionVerified = true; // Genuinely logged in via QR
                 this.loginInProgress = false;
                 await this.saveCookies();
                 this.saveSession({
                     loggedInAt: new Date().toISOString(),
                     status: "connected",
                 });
-                console.log("✅ Paytm QR login successful!");
+                console.log("✅ Paytm QR login successful! (verified)");
                 return { success: true, loggedIn: true };
             }
 
@@ -504,7 +524,7 @@ class PaytmScraper {
     // Session status
     getStatus() {
         return {
-            isLoggedIn: this.isLoggedIn,
+            isLoggedIn: this.isLoggedIn && this.sessionVerified,
             loginInProgress: this.loginInProgress,
             lastCheckedTxns: this.lastCheckedTxns.length,
             discoveredApis: this.discoveredApiUrls.length,
